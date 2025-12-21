@@ -9,6 +9,7 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
 - `/cancel-match [match]` – removes an open scrim if it gets called off.
 - `/check-scrims` – shows every scrim and score, plus controls to remove one or clear them all.
 - Persistent stats saved to `stats.json` so you keep history across restarts.
+- Optional role gating so only members with configured roles can run bot commands.
 
 ## Prerequisites
 
@@ -28,9 +29,12 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
    export GUILD_ID="123456789012345678"
    # Optional: role to ping for new scrims
    export SCRIM_ROLE_ID="987654321098765432"
-   # Optional: text channel where scrim announcements and threads should be created
-   export SCRIM_CHANNEL_ID="123456789012345678"
-   # Optional: text channel where match results will be posted
+    # Optional: allow only these roles to see and use the bot commands (either/both)
+    export COMMAND_ROLE_ID_1="345678901234567890"
+    export COMMAND_ROLE_ID_2="456789012345678901"
+    # Optional: text channel where scrim announcements and threads should be created
+    export SCRIM_CHANNEL_ID="123456789012345678"
+    # Optional: text channel where match results will be posted
    export RESULTS_CHANNEL_ID="234567890123456789"
    # Optional: timezone for parsing DD HH:MM inputs (defaults to UTC)
    export TIMEZONE="UTC"
@@ -76,3 +80,4 @@ Match history is stored in `stats.json` in the project root. The file is ignored
 
 - Commands sync globally by default. Provide `GUILD_ID` during local testing to speed up registration.
 - Time parsing expects `DD HH:MM` and uses `TIMEZONE`; if parsing fails, the bot keeps your original time text.
+- Set `COMMAND_ROLE_ID_1` and/or `COMMAND_ROLE_ID_2` to limit who can run slash commands; others will receive an ephemeral permission error.

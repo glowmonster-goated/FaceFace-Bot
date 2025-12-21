@@ -18,6 +18,14 @@ DATA_PATH = Path("stats.json")
 DEFAULT_TIMEZONE = os.environ.get("TIMEZONE", "UTC")
 SCRIM_CHANNEL_ID_ENV = os.environ.get("SCRIM_CHANNEL_ID")
 RESULTS_CHANNEL_ID_ENV = os.environ.get("RESULTS_CHANNEL_ID")
+COMMAND_ROLE_IDS = {
+    int(role_id)
+    for role_id in (
+        os.environ.get("COMMAND_ROLE_ID_1"),
+        os.environ.get("COMMAND_ROLE_ID_2"),
+    )
+    if role_id and role_id.isdigit()
+}
 
 NA_TIMEZONES: Dict[str, str] = {
     "EST": "America/New_York",
@@ -554,7 +562,37 @@ scrim_role_id_env = os.environ.get("SCRIM_ROLE_ID")
 bot = ScrimBot(store, guild_id=guild_id)
 
 
+def member_has_command_role(member: Optional[discord.Member]) -> bool:
+    if not COMMAND_ROLE_IDS:
+        return True
+    if member is None:
+        return False
+    return any(role.id in COMMAND_ROLE_IDS for role in member.roles)
+
+
+async def ensure_command_role(interaction: discord.Interaction) -> bool:
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if member_has_command_role(member):
+        return True
+    if member is None:
+        raise app_commands.CheckFailure("This command can only be used in a server.")
+    raise app_commands.CheckFailure("You do not have permission to use this bot.")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    if isinstance(error, app_commands.CheckFailure):
+        message = str(error) or "You do not have permission to use this bot."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return
+    raise error
+
+
 @bot.tree.command(name="scrim", description="Schedule a scrim with a team.")
+@app_commands.check(ensure_command_role)
 @app_commands.describe(
     team_name="Opponent team name",
     time="Time in DD HH:MM format",
@@ -625,6 +663,7 @@ async def scrim_command(
 
 
 @bot.tree.command(name="check-scrims", description="Show all scrims and their results.")
+@app_commands.check(ensure_command_role)
 async def check_scrims(interaction: discord.Interaction) -> None:
     lines = [summarize_match(match) for match in store.matches]
     description = "\n".join(lines) if lines else "No scrims recorded yet."
@@ -634,6 +673,7 @@ async def check_scrims(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(name="submit-scores", description="Record a match result.")
+@app_commands.check(ensure_command_role)
 @app_commands.describe(
     match_id="Choose an open match to record",
     outcome="Did we win or lose?",
@@ -698,6 +738,7 @@ async def match_autocomplete(interaction: discord.Interaction, current: str) -> 
 
 
 @bot.tree.command(name="cancel-match", description="Cancel an open match.")
+@app_commands.check(ensure_command_role)
 @app_commands.describe(match_id="Choose an open match to cancel")
 async def cancel_match(interaction: discord.Interaction, match_id: str) -> None:
     if not match_id.isdigit():
