@@ -263,9 +263,16 @@ class ScrimBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.store = store
         self.guild_id = guild_id
-        self.view = StatsView(store)
+        self.view: Optional[StatsView] = None
+
+    def get_stats_view(self) -> StatsView:
+        if self.view is None:
+            self.view = StatsView(self.store)
+            self.add_view(self.view)
+        return self.view
 
     async def setup_hook(self) -> None:
+        self.view = StatsView(self.store)
         self.add_view(self.view)
         if self.guild_id:
             guild = discord.Object(id=self.guild_id)
@@ -356,14 +363,15 @@ async def submit_scores(
     embed.add_field(name="Scheduled time", value=match.display_time, inline=True)
     embed.add_field(name="Totals", value=f"Wins: {wins}\nLosses: {losses}", inline=False)
 
+    view = bot.get_stats_view()
     results_channel = await resolve_text_channel(bot, RESULTS_CHANNEL_ID_ENV, interaction.channel)
     if results_channel:
-        await results_channel.send(embed=embed, view=bot.view)
+        await results_channel.send(embed=embed, view=view)
         await interaction.response.send_message(
-            f"Result posted to {results_channel.mention}.", embed=embed, view=bot.view, ephemeral=True
+            f"Result posted to {results_channel.mention}.", embed=embed, view=view, ephemeral=True
         )
     else:
-        await interaction.response.send_message(embed=embed, view=bot.view)
+        await interaction.response.send_message(embed=embed, view=view)
 
 
 @submit_scores.autocomplete("match_id")
