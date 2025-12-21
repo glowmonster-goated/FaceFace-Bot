@@ -9,7 +9,10 @@ from zoneinfo import ZoneInfo
 import discord
 from discord import app_commands
 from discord.ext import commands
+from dotenv import load_dotenv
 
+
+load_dotenv()
 
 DATA_PATH = Path("stats.json")
 DEFAULT_TIMEZONE = os.environ.get("TIMEZONE", "UTC")
@@ -386,7 +389,9 @@ async def match_autocomplete(interaction: discord.Interaction, current: str) -> 
 def main() -> None:
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
-        raise RuntimeError("DISCORD_TOKEN environment variable is required")
+        raise SystemExit(
+            "DISCORD_TOKEN environment variable is required. Set it in a .env file or export it before running the bot."
+        )
     bot.run(token)
 
 

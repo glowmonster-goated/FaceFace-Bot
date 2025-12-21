@@ -19,7 +19,7 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
    ```bash
    pip install -r requirements.txt
    ```
-2. Copy `.env.example` to `.env` and fill in the values, or export the variables manually:
+2. Copy `.env.example` to `.env` and fill in the values (the bot will load `.env` automatically), or export the variables manually:
    ```bash
    export DISCORD_TOKEN="your_bot_token"
    # Optional: limit slash command registration to a single guild for faster sync
