@@ -19,6 +19,12 @@ DEFAULT_TIMEZONE = os.environ.get("TIMEZONE", "UTC")
 SCRIM_CHANNEL_ID_ENV = os.environ.get("SCRIM_CHANNEL_ID")
 RESULTS_CHANNEL_ID_ENV = os.environ.get("RESULTS_CHANNEL_ID")
 
+NA_TIMEZONES: Dict[str, str] = {
+    "EST": "America/New_York",
+    "CST": "America/Chicago",
+    "PST": "America/Los_Angeles",
+}
+
 
 @dataclass
 class TeamRecord:
@@ -44,6 +50,7 @@ class Match:
     team: str
     display_time: str
     time_iso: Optional[str]
+    timezone: Optional[str] = None
     channel_id: Optional[int] = None
     message_id: Optional[int] = None
     thread_id: Optional[int] = None
@@ -59,6 +66,7 @@ class Match:
             "team": self.team,
             "display_time": self.display_time,
             "time_iso": self.time_iso,
+            "timezone": self.timezone,
             "channel_id": self.channel_id,
             "message_id": self.message_id,
             "thread_id": self.thread_id,
@@ -76,6 +84,7 @@ class Match:
             team=str(data.get("team", "Unknown")),
             display_time=str(data.get("display_time", "Unknown")),
             time_iso=str(data["time_iso"]) if data.get("time_iso") else None,
+            timezone=str(data["timezone"]) if data.get("timezone") else None,
             channel_id=int(data["channel_id"]) if data.get("channel_id") else None,
             message_id=int(data["message_id"]) if data.get("message_id") else None,
             thread_id=int(data["thread_id"]) if data.get("thread_id") else None,
@@ -154,12 +163,13 @@ class StatsStore:
         entries.sort(key=lambda item: item[0].lower())
         return entries
 
-    def add_match(self, team: str, display_time: str, time_iso: Optional[str]) -> Match:
+    def add_match(self, team: str, display_time: str, time_iso: Optional[str], timezone: Optional[str]) -> Match:
         match = Match(
             match_id=self.next_match_id,
             team=team.strip(),
             display_time=display_time,
             time_iso=time_iso,
+            timezone=timezone,
         )
         self.matches.append(match)
         self.next_match_id += 1
@@ -344,8 +354,14 @@ class ScrimManagerView(discord.ui.View):
         await interaction.response.send_message("Select a scrim to remove.", view=view, ephemeral=True)
 
 
-def parse_day_time(day_time: str) -> Tuple[str, Optional[datetime]]:
-    """Parse `DD HH:MM` into a datetime in the configured timezone."""
+def resolve_timezone_name(timezone_key: Optional[str]) -> str:
+    if timezone_key and timezone_key in NA_TIMEZONES:
+        return NA_TIMEZONES[timezone_key]
+    return DEFAULT_TIMEZONE
+
+
+def parse_day_time(day_time: str, timezone_name: Optional[str]) -> Tuple[str, Optional[datetime]]:
+    """Parse `DD HH:MM` into a datetime in the supplied timezone."""
 
     parts = day_time.strip().split()
     if len(parts) != 2:
@@ -360,7 +376,7 @@ def parse_day_time(day_time: str) -> Tuple[str, Optional[datetime]]:
         return day_time, None
 
     try:
-        tz = ZoneInfo(DEFAULT_TIMEZONE)
+        tz = ZoneInfo(timezone_name or DEFAULT_TIMEZONE)
     except Exception:
         tz = None
 
@@ -383,12 +399,24 @@ def parse_day_time(day_time: str) -> Tuple[str, Optional[datetime]]:
     return day_time, candidate
 
 
-def create_timestamp(day_time: str) -> Tuple[str, str, Optional[str]]:
-    display_time, parsed = parse_day_time(day_time)
+def timezone_label(timezone_name: Optional[str], parsed: Optional[datetime]) -> str:
+    if parsed and parsed.tzinfo and parsed.tzname():
+        return parsed.tzname() or DEFAULT_TIMEZONE
+    if timezone_name:
+        for label, zone in NA_TIMEZONES.items():
+            if timezone_name in (label, zone):
+                return label
+        return timezone_name
+    return DEFAULT_TIMEZONE
+
+
+def create_timestamp(day_time: str, timezone_name: Optional[str]) -> Tuple[str, str, Optional[str], str]:
+    display_time, parsed = parse_day_time(day_time, timezone_name)
+    tz_label = timezone_label(timezone_name, parsed)
     if parsed is None:
-        return display_time, display_time, None
+        return display_time, display_time, None, tz_label
     formatted = discord.utils.format_dt(parsed, "F")
-    return display_time, formatted, parsed.isoformat()
+    return display_time, formatted, parsed.isoformat(), tz_label
 
 
 def summarize_match(match: Match) -> str:
@@ -407,6 +435,18 @@ def summarize_match(match: Match) -> str:
         f"#{match.match_id} vs **{match.team}** at {match.display_time} — "
         f"{status_label}{f' ({detail})' if detail else ''}"
     )
+
+
+def format_scheduled_time(match: Match) -> str:
+    if not match.time_iso:
+        return match.display_time
+    try:
+        dt = datetime.fromisoformat(match.time_iso)
+        if dt.tzinfo is None and match.timezone:
+            dt = dt.replace(tzinfo=ZoneInfo(match.timezone))
+        return discord.utils.format_dt(dt, "F")
+    except Exception:
+        return match.display_time
 
 
 async def resolve_text_channel(bot: commands.Bot, channel_id_env: Optional[str], fallback: Optional[discord.abc.Messageable]) -> Optional[discord.TextChannel]:
@@ -452,12 +492,6 @@ class ScrimBot(commands.Bot):
 
     @tasks.loop(minutes=1)
     async def reminder_loop(self) -> None:
-        try:
-            tz = ZoneInfo(DEFAULT_TIMEZONE)
-        except Exception:
-            tz = None
-
-        now = datetime.now(tz=tz) if tz else datetime.utcnow()
         for match in list(self.store.matches):
             if match.status != "open" or not match.time_iso or match.reminder_sent:
                 continue
@@ -465,8 +499,17 @@ class ScrimBot(commands.Bot):
                 event_time = datetime.fromisoformat(match.time_iso)
             except ValueError:
                 continue
-            if event_time.tzinfo is None and tz is not None:
-                event_time = event_time.replace(tzinfo=tz)
+            tz_name = match.timezone or DEFAULT_TIMEZONE
+            tz_info = None
+            try:
+                tz_info = ZoneInfo(tz_name)
+            except Exception:
+                tz_info = event_time.tzinfo
+
+            if event_time.tzinfo is None and tz_info is not None:
+                event_time = event_time.replace(tzinfo=tz_info)
+
+            now = datetime.now(tz=event_time.tzinfo) if event_time.tzinfo else datetime.utcnow()
             if event_time - timedelta(minutes=10) <= now < event_time:
                 if match.channel_id is None:
                     continue
@@ -495,10 +538,18 @@ bot = ScrimBot(store, guild_id=guild_id)
 
 @bot.tree.command(name="scrim", description="Schedule a scrim with a team.")
 @app_commands.describe(team_name="Opponent team name", time="Time in DD HH:MM format")
+@app_commands.choices(
+    timezone=[
+        app_commands.Choice(name="Eastern (EST)", value="EST"),
+        app_commands.Choice(name="Central (CST)", value="CST"),
+        app_commands.Choice(name="Pacific (PST)", value="PST"),
+    ]
+)
 async def scrim_command(
     interaction: discord.Interaction,
     team_name: str,
     time: str,
+    timezone: Optional[app_commands.Choice[str]] = None,
 ) -> None:
     target_channel = await resolve_text_channel(bot, SCRIM_CHANNEL_ID_ENV, interaction.channel)
     if target_channel is None:
@@ -507,17 +558,19 @@ async def scrim_command(
         )
         return
 
-    display_time, timestamp, iso_time = create_timestamp(time)
-    match = store.add_match(team_name, display_time, iso_time)
+    timezone_name = resolve_timezone_name(timezone.value if timezone else None)
+    display_time, timestamp, iso_time, tz_label = create_timestamp(time, timezone_name)
+    annotated_time = f"{display_time} {tz_label}".strip()
+    match = store.add_match(team_name, annotated_time, iso_time, timezone_name)
     role_mention = f"<@&{scrim_role_id_env}> " if scrim_role_id_env else ""
     embed = discord.Embed(
         title="Scrim scheduled",
-        description=f"Team: **{team_name}**\nTime: {timestamp}",
+        description=f"Team: **{team_name}**\nTime: {timestamp} ({tz_label})",
         color=discord.Color.blurple(),
     )
     embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
     scrim_message = await target_channel.send(
-        content=f"{role_mention}Scrim at {display_time} against **{team_name}**",
+        content=f"{role_mention}Scrim at {annotated_time} against **{team_name}**",
         embed=embed,
         allowed_mentions=discord.AllowedMentions(roles=True),
     )
@@ -578,12 +631,20 @@ async def submit_scores(
 
     wins, losses = store.totals()
 
-    embed = discord.Embed(title="Match recorded", color=discord.Color.brand_green())
-    embed.add_field(name="Result", value=outcome.name, inline=True)
-    embed.add_field(name="Opponent", value=match.team, inline=True)
-    embed.add_field(name="Score", value=overall_score, inline=True)
-    embed.add_field(name="Scheduled time", value=match.display_time, inline=True)
-    embed.add_field(name="Totals", value=f"Wins: {wins}\nLosses: {losses}", inline=False)
+    won = outcome.value == "win"
+    result_label = "Win" if won else "Loss"
+    result_emoji = "✅" if won else "❌"
+    embed_color = discord.Color.brand_green() if won else discord.Color.red()
+    scheduled_value = format_scheduled_time(match)
+
+    embed = discord.Embed(
+        title=f"{result_emoji} {result_label} vs {match.team}",
+        description=f"Score: **{overall_score}**\nScheduled: {scheduled_value}",
+        color=embed_color,
+    )
+    embed.add_field(name="Record", value=f"Wins: {wins}\nLosses: {losses}", inline=True)
+    embed.add_field(name="Match ID", value=f"#{match.match_id}", inline=True)
+    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
 
     view = bot.get_stats_view()
     results_channel = await resolve_text_channel(bot, RESULTS_CHANNEL_ID_ENV, interaction.channel)
