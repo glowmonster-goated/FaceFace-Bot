@@ -4,8 +4,9 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
 
 ## Features
 
-- `/scrim [team_name] [time]` – schedules a scrim, pings a configured role, and creates a discussion thread.
+- `/scrim [team_name] [time]` – schedules a scrim, pings a configured role, creates a discussion thread, and adds ✅/❌ reactions for RSVPs.
 - `/submit-scores [match] [outcome] [overall_score]` – records a win/loss for an open scrim, keeps running totals, and exposes buttons to list all wins or losses (case-insensitive team names).
+- `/cancel-match [match]` – removes an open scrim if it gets called off.
 - Persistent stats saved to `stats.json` so you keep history across restarts.
 
 ## Prerequisites
@@ -44,7 +45,7 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
 
 - **team_name**: Opponent team name.
 - **time**: In `DD HH:MM` format. Times are parsed in the configured `TIMEZONE` (defaults to `UTC`) and rendered as Discord timestamps; if parsing fails, the raw text is echoed.
-- Behavior: posts to `SCRIM_CHANNEL_ID` (if set, otherwise the command channel), pings the `SCRIM_ROLE_ID` (if set), labels the message with a match number, and opens a thread for discussion.
+- Behavior: posts to `SCRIM_CHANNEL_ID` (if set, otherwise the command channel), pings the `SCRIM_ROLE_ID` (if set), adds ✅/❌ reactions for RSVPs, and opens a thread for discussion. Users who tap ✅ are reminded 10 minutes before the scrim time.
 
 ### `/submit-scores`
 
@@ -53,6 +54,11 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
 - **overall_score**: Free-form score string (e.g., `13-11`).
 
 The response includes running totals plus buttons to show all wins or all losses. When listing opponents, repeat matches display a count (e.g., `Team ABC (2)`). Closed scrims drop out of the autocomplete list. Results are posted to `RESULTS_CHANNEL_ID` when set.
+
+### `/cancel-match`
+
+- **match**: Choose from open scrims (autocomplete shows `#id vs team at time`).
+- Behavior: removes the open scrim from storage and replies to the original scrim message (when possible) that it was cancelled.
 
 ## Data
 

@@ -1,14 +1,14 @@
 import json
 import os
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 
@@ -44,6 +44,10 @@ class Match:
     team: str
     display_time: str
     time_iso: Optional[str]
+    channel_id: Optional[int] = None
+    message_id: Optional[int] = None
+    interested_user_ids: List[int] = field(default_factory=list)
+    reminder_sent: bool = False
     status: Literal["open", "closed"] = "open"
     outcome: Optional[Literal["win", "loss"]] = None
     score: Optional[str] = None
@@ -54,6 +58,10 @@ class Match:
             "team": self.team,
             "display_time": self.display_time,
             "time_iso": self.time_iso,
+            "channel_id": self.channel_id,
+            "message_id": self.message_id,
+            "interested_user_ids": self.interested_user_ids,
+            "reminder_sent": self.reminder_sent,
             "status": self.status,
             "outcome": self.outcome,
             "score": self.score,
@@ -66,6 +74,10 @@ class Match:
             team=str(data.get("team", "Unknown")),
             display_time=str(data.get("display_time", "Unknown")),
             time_iso=str(data["time_iso"]) if data.get("time_iso") else None,
+            channel_id=int(data["channel_id"]) if data.get("channel_id") else None,
+            message_id=int(data["message_id"]) if data.get("message_id") else None,
+            interested_user_ids=[int(user_id) for user_id in data.get("interested_user_ids", [])],
+            reminder_sent=bool(data.get("reminder_sent", False)),
             status=str(data.get("status", "open")),
             outcome=str(data["outcome"]) if data.get("outcome") else None,  # type: ignore[arg-type]
             score=str(data["score"]) if data.get("score") else None,
@@ -150,6 +162,37 @@ class StatsStore:
         self.next_match_id += 1
         self._save()
         return match
+
+    def link_message(self, match_id: int, channel_id: int, message_id: int) -> None:
+        match = self.get_match(match_id)
+        if not match:
+            return
+        match.channel_id = channel_id
+        match.message_id = message_id
+        self._save()
+
+    def add_participant(self, match_id: int, user_id: int) -> None:
+        match = self.get_match(match_id)
+        if not match or match.status != "open":
+            return
+        if user_id not in match.interested_user_ids:
+            match.interested_user_ids.append(user_id)
+            self._save()
+
+    def mark_reminder_sent(self, match_id: int) -> None:
+        match = self.get_match(match_id)
+        if not match:
+            return
+        match.reminder_sent = True
+        self._save()
+
+    def cancel_match(self, match_id: int) -> Optional[Match]:
+        for index, match in enumerate(self.matches):
+            if match.match_id == match_id and match.status == "open":
+                removed = self.matches.pop(index)
+                self._save()
+                return removed
+        return None
 
     def list_open_matches(self) -> List[Match]:
         return [m for m in self.matches if m.status == "open"]
@@ -267,6 +310,7 @@ class ScrimBot(commands.Bot):
         self.store = store
         self.guild_id = guild_id
         self.view: Optional[StatsView] = None
+        self.reminder_loop.add_exception_type(Exception)
 
     def get_stats_view(self) -> StatsView:
         if self.view is None:
@@ -277,12 +321,49 @@ class ScrimBot(commands.Bot):
     async def setup_hook(self) -> None:
         self.view = StatsView(self.store)
         self.add_view(self.view)
+        if not self.reminder_loop.is_running():
+            self.reminder_loop.start()
         if self.guild_id:
             guild = discord.Object(id=self.guild_id)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
         else:
             await self.tree.sync()
+
+    @tasks.loop(minutes=1)
+    async def reminder_loop(self) -> None:
+        try:
+            tz = ZoneInfo(DEFAULT_TIMEZONE)
+        except Exception:
+            tz = None
+
+        now = datetime.now(tz=tz) if tz else datetime.utcnow()
+        for match in list(self.store.matches):
+            if match.status != "open" or not match.time_iso or match.reminder_sent:
+                continue
+            try:
+                event_time = datetime.fromisoformat(match.time_iso)
+            except ValueError:
+                continue
+            if event_time.tzinfo is None and tz is not None:
+                event_time = event_time.replace(tzinfo=tz)
+            if event_time - timedelta(minutes=10) <= now < event_time:
+                if match.channel_id is None:
+                    continue
+                channel = self.get_channel(match.channel_id)
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+                mentions = " ".join(f"<@{user_id}>" for user_id in match.interested_user_ids)
+                if not mentions:
+                    mentions = "Reminder for the upcoming scrim."
+                try:
+                    await channel.send(
+                        f"Reminder: scrim vs **{match.team}** at {match.display_time} in 10 minutes. {mentions}",
+                        allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+                    )
+                    self.store.mark_reminder_sent(match.match_id)
+                except Exception:
+                    continue
 
 
 store = StatsStore(DATA_PATH)
@@ -314,12 +395,19 @@ async def scrim_command(
         description=f"Team: **{team_name}**\nTime: {timestamp}",
         color=discord.Color.blurple(),
     )
-    embed.set_footer(text="Format: DD HH:MM (uses TIMEZONE env if set)")
     scrim_message = await target_channel.send(
-        content=f"{role_mention}Scrim at {display_time} against **{team_name}** (Match #{match.match_id})",
+        content=f"{role_mention}Scrim at {display_time} against **{team_name}**",
         embed=embed,
         allowed_mentions=discord.AllowedMentions(roles=True),
     )
+
+    store.link_message(match.match_id, scrim_message.channel.id, scrim_message.id)
+
+    for emoji in ("✅", "❌"):
+        try:
+            await scrim_message.add_reaction(emoji)
+        except Exception:
+            pass
 
     try:
         await scrim_message.create_thread(name=f"Scrim vs {team_name}")
@@ -384,6 +472,52 @@ async def match_autocomplete(interaction: discord.Interaction, current: str) -> 
         label = f"#{match.match_id} vs {match.team} at {match.display_time}"
         choices.append(app_commands.Choice(name=label, value=str(match.match_id)))
     return choices[:25]
+
+
+@bot.tree.command(name="cancel-match", description="Cancel an open match.")
+@app_commands.describe(match_id="Choose an open match to cancel")
+async def cancel_match(interaction: discord.Interaction, match_id: str) -> None:
+    if not match_id.isdigit():
+        await interaction.response.send_message("Please choose a valid match.", ephemeral=True)
+        return
+
+    removed = store.cancel_match(int(match_id))
+    if removed is None:
+        await interaction.response.send_message("Match not found or already closed.", ephemeral=True)
+        return
+
+    if removed.channel_id and removed.message_id:
+        channel = bot.get_channel(removed.channel_id)
+        if isinstance(channel, discord.TextChannel):
+            try:
+                message = await channel.fetch_message(removed.message_id)
+                await message.reply("This scrim has been cancelled.")
+            except Exception:
+                pass
+
+    await interaction.response.send_message(
+        f"Cancelled match vs {removed.team} at {removed.display_time}.", ephemeral=True
+    )
+
+
+@cancel_match.autocomplete("match_id")
+async def cancel_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    return await match_autocomplete(interaction, current)
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    if bot.user and payload.user_id == bot.user.id:
+        return
+
+    emoji = str(payload.emoji)
+    if emoji != "✅":
+        return
+
+    for match in store.list_open_matches():
+        if match.message_id == payload.message_id:
+            store.add_participant(match.match_id, payload.user_id)
+            break
 
 
 def main() -> None:
