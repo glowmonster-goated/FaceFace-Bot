@@ -26,6 +26,10 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
    export GUILD_ID="123456789012345678"
    # Optional: role to ping for new scrims
    export SCRIM_ROLE_ID="987654321098765432"
+   # Optional: text channel where scrim announcements and threads should be created
+   export SCRIM_CHANNEL_ID="123456789012345678"
+   # Optional: text channel where match results will be posted
+   export RESULTS_CHANNEL_ID="234567890123456789"
    # Optional: timezone for parsing DD HH:MM inputs (defaults to UTC)
    export TIMEZONE="UTC"
    ```
@@ -40,7 +44,7 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
 
 - **team_name**: Opponent team name.
 - **time**: In `DD HH:MM` format. Times are parsed in the configured `TIMEZONE` (defaults to `UTC`) and rendered as Discord timestamps; if parsing fails, the raw text is echoed.
-- Behavior: pings the `SCRIM_ROLE_ID` (if set), labels the message with a match number, and opens a thread for discussion.
+- Behavior: posts to `SCRIM_CHANNEL_ID` (if set, otherwise the command channel), pings the `SCRIM_ROLE_ID` (if set), labels the message with a match number, and opens a thread for discussion.
 
 ### `/submit-scores`
 
@@ -48,7 +52,7 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
 - **outcome**: `win` or `loss`.
 - **overall_score**: Free-form score string (e.g., `13-11`).
 
-The response includes running totals plus buttons to show all wins or all losses. When listing opponents, repeat matches display a count (e.g., `Team ABC (2)`). Closed scrims drop out of the autocomplete list.
+The response includes running totals plus buttons to show all wins or all losses. When listing opponents, repeat matches display a count (e.g., `Team ABC (2)`). Closed scrims drop out of the autocomplete list. Results are posted to `RESULTS_CHANNEL_ID` when set.
 
 ## Data
 

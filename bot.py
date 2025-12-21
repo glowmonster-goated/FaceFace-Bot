@@ -13,6 +13,8 @@ from discord.ext import commands
 
 DATA_PATH = Path("stats.json")
 DEFAULT_TIMEZONE = os.environ.get("TIMEZONE", "UTC")
+SCRIM_CHANNEL_ID_ENV = os.environ.get("SCRIM_CHANNEL_ID")
+RESULTS_CHANNEL_ID_ENV = os.environ.get("RESULTS_CHANNEL_ID")
 
 
 @dataclass
@@ -241,6 +243,20 @@ def create_timestamp(day_time: str) -> Tuple[str, str, Optional[str]]:
     return display_time, formatted, parsed.isoformat()
 
 
+async def resolve_text_channel(bot: commands.Bot, channel_id_env: Optional[str], fallback: Optional[discord.abc.Messageable]) -> Optional[discord.TextChannel]:
+    if channel_id_env and channel_id_env.isdigit():
+        channel = bot.get_channel(int(channel_id_env))
+        if isinstance(channel, discord.TextChannel):
+            return channel
+        try:
+            fetched = await bot.fetch_channel(int(channel_id_env))
+        except Exception:
+            fetched = None
+        if isinstance(fetched, discord.TextChannel):
+            return fetched
+    return channel if isinstance(channel := fallback, discord.TextChannel) else None
+
+
 class ScrimBot(commands.Bot):
     def __init__(self, store: StatsStore, guild_id: Optional[int] = None) -> None:
         intents = discord.Intents.default()
@@ -273,6 +289,13 @@ async def scrim_command(
     team_name: str,
     time: str,
 ) -> None:
+    target_channel = await resolve_text_channel(bot, SCRIM_CHANNEL_ID_ENV, interaction.channel)
+    if target_channel is None:
+        await interaction.response.send_message(
+            "Could not find a text channel to post the scrim. Check SCRIM_CHANNEL_ID.", ephemeral=True
+        )
+        return
+
     display_time, timestamp, iso_time = create_timestamp(time)
     match = store.add_match(team_name, display_time, iso_time)
     role_mention = f"<@&{scrim_role_id_env}> " if scrim_role_id_env else ""
@@ -282,14 +305,21 @@ async def scrim_command(
         color=discord.Color.blurple(),
     )
     embed.set_footer(text="Format: DD HH:MM (uses TIMEZONE env if set)")
-    await interaction.response.send_message(content=f"{role_mention}Scrim at {display_time} against **{team_name}** (Match #{match.match_id})", embed=embed, allowed_mentions=discord.AllowedMentions(roles=True))
+    scrim_message = await target_channel.send(
+        content=f"{role_mention}Scrim at {display_time} against **{team_name}** (Match #{match.match_id})",
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(roles=True),
+    )
 
     try:
-        message = await interaction.original_response()
-        await message.create_thread(name=f"Scrim vs {team_name}")
+        await scrim_message.create_thread(name=f"Scrim vs {team_name}")
     except Exception:
         # Fail silently if threads are not allowed or cannot be created.
         pass
+
+    await interaction.response.send_message(
+        f"Scrim posted in {target_channel.mention} as Match #{match.match_id}.", ephemeral=True
+    )
 
 
 @bot.tree.command(name="submit-scores", description="Record a match result.")
@@ -326,7 +356,14 @@ async def submit_scores(
     embed.add_field(name="Scheduled time", value=match.display_time, inline=True)
     embed.add_field(name="Totals", value=f"Wins: {wins}\nLosses: {losses}", inline=False)
 
-    await interaction.response.send_message(embed=embed, view=bot.view)
+    results_channel = await resolve_text_channel(bot, RESULTS_CHANNEL_ID_ENV, interaction.channel)
+    if results_channel:
+        await results_channel.send(embed=embed, view=bot.view)
+        await interaction.response.send_message(
+            f"Result posted to {results_channel.mention}.", embed=embed, view=bot.view, ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(embed=embed, view=bot.view)
 
 
 @submit_scores.autocomplete("match_id")
