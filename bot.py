@@ -12,6 +12,7 @@ from discord.ext import commands
 
 
 DATA_PATH = Path("stats.json")
+DEFAULT_TIMEZONE = os.environ.get("TIMEZONE", "UTC")
 
 
 @dataclass
@@ -32,10 +33,46 @@ class TeamRecord:
         )
 
 
+@dataclass
+class Match:
+    match_id: int
+    team: str
+    display_time: str
+    time_iso: Optional[str]
+    status: Literal["open", "closed"] = "open"
+    outcome: Optional[Literal["win", "loss"]] = None
+    score: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "match_id": self.match_id,
+            "team": self.team,
+            "display_time": self.display_time,
+            "time_iso": self.time_iso,
+            "status": self.status,
+            "outcome": self.outcome,
+            "score": self.score,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "Match":
+        return cls(
+            match_id=int(data.get("match_id", 0)),
+            team=str(data.get("team", "Unknown")),
+            display_time=str(data.get("display_time", "Unknown")),
+            time_iso=str(data["time_iso"]) if data.get("time_iso") else None,
+            status=str(data.get("status", "open")),
+            outcome=str(data["outcome"]) if data.get("outcome") else None,  # type: ignore[arg-type]
+            score=str(data["score"]) if data.get("score") else None,
+        )
+
+
 class StatsStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.teams: Dict[str, TeamRecord] = {}
+        self.matches: List[Match] = []
+        self.next_match_id = 1
         self._load()
 
     def _load(self) -> None:
@@ -46,12 +83,27 @@ class StatsStore:
         except json.JSONDecodeError:
             return
 
+        if not isinstance(content, dict):
+            return
+
         teams_data = content.get("teams", {}) if isinstance(content, dict) else {}
         for key, entry in teams_data.items():
             self.teams[key] = TeamRecord.from_dict(entry)
 
+        matches_data = content.get("matches", [])
+        if isinstance(matches_data, list):
+            for entry in matches_data:
+                if isinstance(entry, dict):
+                    self.matches.append(Match.from_dict(entry))
+
+        self.next_match_id = int(content.get("next_match_id", len(self.matches) + 1))
+
     def _save(self) -> None:
-        payload = {"teams": {k: v.as_dict() for k, v in self.teams.items()}}
+        payload = {
+            "teams": {k: v.as_dict() for k, v in self.teams.items()},
+            "matches": [m.as_dict() for m in self.matches],
+            "next_match_id": self.next_match_id,
+        }
         self.path.write_text(json.dumps(payload, indent=2))
 
     def _normalize_key(self, team_name: str) -> str:
@@ -82,6 +134,38 @@ class StatsStore:
         entries.sort(key=lambda item: item[0].lower())
         return entries
 
+    def add_match(self, team: str, display_time: str, time_iso: Optional[str]) -> Match:
+        match = Match(
+            match_id=self.next_match_id,
+            team=team.strip(),
+            display_time=display_time,
+            time_iso=time_iso,
+        )
+        self.matches.append(match)
+        self.next_match_id += 1
+        self._save()
+        return match
+
+    def list_open_matches(self) -> List[Match]:
+        return [m for m in self.matches if m.status == "open"]
+
+    def get_match(self, match_id: int) -> Optional[Match]:
+        for match in self.matches:
+            if match.match_id == match_id:
+                return match
+        return None
+
+    def close_match(self, match_id: int, outcome: Literal["win", "loss"], score: str) -> Optional[Match]:
+        match = self.get_match(match_id)
+        if match is None or match.status != "open":
+            return None
+        match.status = "closed"
+        match.outcome = outcome
+        match.score = score
+        self.record_result(match.team, outcome)
+        self._save()
+        return match
+
 
 class StatsView(discord.ui.View):
     def __init__(self, store: StatsStore) -> None:
@@ -110,27 +194,51 @@ class StatsView(discord.ui.View):
         await interaction.response.send_message(message, ephemeral=True)
 
 
-def create_timestamp(time_text: str, timezone: str) -> str:
-    tz: Optional[ZoneInfo]
+def parse_day_time(day_time: str) -> Tuple[str, Optional[datetime]]:
+    """Parse `DD HH:MM` into a datetime in the configured timezone."""
+
+    parts = day_time.strip().split()
+    if len(parts) != 2:
+        return day_time, None
+
     try:
-        tz = ZoneInfo(timezone)
+        day = int(parts[0])
+        hour_minute = parts[1].split(":")
+        hour = int(hour_minute[0])
+        minute = int(hour_minute[1]) if len(hour_minute) > 1 else 0
+    except (ValueError, IndexError):
+        return day_time, None
+
+    try:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
     except Exception:
         tz = None
 
-    if tz is None:
-        return f"{time_text} ({timezone})"
-
+    now = datetime.now(tz=tz)
     try:
-        parsed = datetime.fromisoformat(time_text)
+        candidate = datetime(now.year, now.month, day, hour, minute, tzinfo=tz)
     except ValueError:
-        return f"{time_text} ({timezone})"
+        return day_time, None
 
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=tz)
-    else:
-        parsed = parsed.astimezone(tz)
+    if candidate < now:
+        # Move to the next month when the date has already passed.
+        month = candidate.month + 1
+        year = candidate.year + (1 if month == 13 else 0)
+        month = 1 if month == 13 else month
+        try:
+            candidate = candidate.replace(year=year, month=month)
+        except ValueError:
+            candidate = None
 
-    return discord.utils.format_dt(parsed, "F")
+    return day_time, candidate
+
+
+def create_timestamp(day_time: str) -> Tuple[str, str, Optional[str]]:
+    display_time, parsed = parse_day_time(day_time)
+    if parsed is None:
+        return display_time, display_time, None
+    formatted = discord.utils.format_dt(parsed, "F")
+    return display_time, formatted, parsed.isoformat()
 
 
 class ScrimBot(commands.Bot):
@@ -154,30 +262,39 @@ class ScrimBot(commands.Bot):
 store = StatsStore(DATA_PATH)
 guild_id_env = os.environ.get("GUILD_ID")
 guild_id = int(guild_id_env) if guild_id_env and guild_id_env.isdigit() else None
+scrim_role_id_env = os.environ.get("SCRIM_ROLE_ID")
 bot = ScrimBot(store, guild_id=guild_id)
 
 
 @bot.tree.command(name="scrim", description="Schedule a scrim with a team.")
-@app_commands.describe(team_name="Opponent team name", time="Time in YYYY-MM-DD HH:MM format", timezone="IANA timezone, e.g. UTC or America/New_York")
+@app_commands.describe(team_name="Opponent team name", time="Time in DD HH:MM format")
 async def scrim_command(
     interaction: discord.Interaction,
     team_name: str,
     time: str,
-    timezone: str = "UTC",
 ) -> None:
-    timestamp = create_timestamp(time, timezone)
+    display_time, timestamp, iso_time = create_timestamp(time)
+    match = store.add_match(team_name, display_time, iso_time)
+    role_mention = f"<@&{scrim_role_id_env}> " if scrim_role_id_env else ""
     embed = discord.Embed(
         title="Scrim scheduled",
         description=f"Team: **{team_name}**\nTime: {timestamp}",
         color=discord.Color.blurple(),
     )
-    embed.set_footer(text="Times use ISO format: YYYY-MM-DD HH:MM")
-    await interaction.response.send_message(embed=embed)
+    embed.set_footer(text="Format: DD HH:MM (uses TIMEZONE env if set)")
+    await interaction.response.send_message(content=f"{role_mention}Scrim at {display_time} against **{team_name}** (Match #{match.match_id})", embed=embed, allowed_mentions=discord.AllowedMentions(roles=True))
+
+    try:
+        message = await interaction.original_response()
+        await message.create_thread(name=f"Scrim vs {team_name}")
+    except Exception:
+        # Fail silently if threads are not allowed or cannot be created.
+        pass
 
 
 @bot.tree.command(name="submit-scores", description="Record a match result.")
 @app_commands.describe(
-    team_name="Opponent team name",
+    match_id="Choose an open match to record",
     outcome="Did we win or lose?",
     overall_score="Score summary, e.g. 13-11",
 )
@@ -187,20 +304,38 @@ async def scrim_command(
 ])
 async def submit_scores(
     interaction: discord.Interaction,
-    team_name: str,
+    match_id: str,
     outcome: app_commands.Choice[str],
     overall_score: str,
 ) -> None:
-    store.record_result(team_name, outcome.value)  # type: ignore[arg-type]
+    if not match_id.isdigit():
+        await interaction.response.send_message("Please choose a valid match.", ephemeral=True)
+        return
+
+    match = store.close_match(int(match_id), outcome.value, overall_score)  # type: ignore[arg-type]
+    if match is None:
+        await interaction.response.send_message("Match not found or already closed.", ephemeral=True)
+        return
+
     wins, losses = store.totals()
 
     embed = discord.Embed(title="Match recorded", color=discord.Color.brand_green())
     embed.add_field(name="Result", value=outcome.name, inline=True)
-    embed.add_field(name="Opponent", value=team_name, inline=True)
+    embed.add_field(name="Opponent", value=match.team, inline=True)
     embed.add_field(name="Score", value=overall_score, inline=True)
+    embed.add_field(name="Scheduled time", value=match.display_time, inline=True)
     embed.add_field(name="Totals", value=f"Wins: {wins}\nLosses: {losses}", inline=False)
 
     await interaction.response.send_message(embed=embed, view=bot.view)
+
+
+@submit_scores.autocomplete("match_id")
+async def match_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    choices: List[app_commands.Choice[str]] = []
+    for match in store.list_open_matches():
+        label = f"#{match.match_id} vs {match.team} at {match.display_time}"
+        choices.append(app_commands.Choice(name=label, value=str(match.match_id)))
+    return choices[:25]
 
 
 def main() -> None:

@@ -4,8 +4,8 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
 
 ## Features
 
-- `/scrim [team_name] [time] [timezone]` – schedules a scrim and echoes a Discord-formatted timestamp when possible.
-- `/submit-scores [team_name] [outcome] [overall_score]` – records a win/loss, keeps running totals, and exposes buttons to list all wins or losses (case-insensitive team names).
+- `/scrim [team_name] [time]` – schedules a scrim, pings a configured role, and creates a discussion thread.
+- `/submit-scores [match] [outcome] [overall_score]` – records a win/loss for an open scrim, keeps running totals, and exposes buttons to list all wins or losses (case-insensitive team names).
 - Persistent stats saved to `stats.json` so you keep history across restarts.
 
 ## Prerequisites
@@ -19,11 +19,15 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
    ```bash
    pip install -r requirements.txt
    ```
-2. Set environment variables:
+2. Copy `.env.example` to `.env` and fill in the values, or export the variables manually:
    ```bash
    export DISCORD_TOKEN="your_bot_token"
    # Optional: limit slash command registration to a single guild for faster sync
    export GUILD_ID="123456789012345678"
+   # Optional: role to ping for new scrims
+   export SCRIM_ROLE_ID="987654321098765432"
+   # Optional: timezone for parsing DD HH:MM inputs (defaults to UTC)
+   export TIMEZONE="UTC"
    ```
 3. Run the bot:
    ```bash
@@ -35,16 +39,16 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
 ### `/scrim`
 
 - **team_name**: Opponent team name.
-- **time**: In `YYYY-MM-DD HH:MM` format. If it parses, the bot responds with a Discord timestamp; otherwise it echoes the raw text.
-- **timezone** (optional): IANA timezone, e.g., `UTC` or `America/New_York` (defaults to `UTC`).
+- **time**: In `DD HH:MM` format. Times are parsed in the configured `TIMEZONE` (defaults to `UTC`) and rendered as Discord timestamps; if parsing fails, the raw text is echoed.
+- Behavior: pings the `SCRIM_ROLE_ID` (if set), labels the message with a match number, and opens a thread for discussion.
 
 ### `/submit-scores`
 
-- **team_name**: Opponent team name (case-insensitive for tracking).
+- **match**: Choose from open scrims (autocomplete shows `#id vs team at time`).
 - **outcome**: `win` or `loss`.
 - **overall_score**: Free-form score string (e.g., `13-11`).
 
-The response includes running totals plus buttons to show all wins or all losses. When listing opponents, repeat matches display a count (e.g., `Team ABC (2)`).
+The response includes running totals plus buttons to show all wins or all losses. When listing opponents, repeat matches display a count (e.g., `Team ABC (2)`). Closed scrims drop out of the autocomplete list.
 
 ## Data
 
@@ -53,4 +57,4 @@ Match history is stored in `stats.json` in the project root. The file is ignored
 ## Notes
 
 - Commands sync globally by default. Provide `GUILD_ID` during local testing to speed up registration.
-- Time parsing relies on ISO-style inputs; if parsing fails, the bot keeps your original time text and timezone label.
+- Time parsing expects `DD HH:MM` and uses `TIMEZONE`; if parsing fails, the bot keeps your original time text.
