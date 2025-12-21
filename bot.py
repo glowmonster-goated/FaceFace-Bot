@@ -46,6 +46,7 @@ class Match:
     time_iso: Optional[str]
     channel_id: Optional[int] = None
     message_id: Optional[int] = None
+    thread_id: Optional[int] = None
     interested_user_ids: List[int] = field(default_factory=list)
     reminder_sent: bool = False
     status: Literal["open", "closed"] = "open"
@@ -60,6 +61,7 @@ class Match:
             "time_iso": self.time_iso,
             "channel_id": self.channel_id,
             "message_id": self.message_id,
+            "thread_id": self.thread_id,
             "interested_user_ids": self.interested_user_ids,
             "reminder_sent": self.reminder_sent,
             "status": self.status,
@@ -76,6 +78,7 @@ class Match:
             time_iso=str(data["time_iso"]) if data.get("time_iso") else None,
             channel_id=int(data["channel_id"]) if data.get("channel_id") else None,
             message_id=int(data["message_id"]) if data.get("message_id") else None,
+            thread_id=int(data["thread_id"]) if data.get("thread_id") else None,
             interested_user_ids=[int(user_id) for user_id in data.get("interested_user_ids", [])],
             reminder_sent=bool(data.get("reminder_sent", False)),
             status=str(data.get("status", "open")),
@@ -171,6 +174,13 @@ class StatsStore:
         match.message_id = message_id
         self._save()
 
+    def link_thread(self, match_id: int, thread_id: int) -> None:
+        match = self.get_match(match_id)
+        if not match:
+            return
+        match.thread_id = thread_id
+        self._save()
+
     def add_participant(self, match_id: int, user_id: int) -> None:
         match = self.get_match(match_id)
         if not match or match.status != "open":
@@ -193,6 +203,21 @@ class StatsStore:
                 self._save()
                 return removed
         return None
+
+    def delete_match(self, match_id: int) -> Optional[Match]:
+        for index, match in enumerate(self.matches):
+            if match.match_id == match_id:
+                removed = self.matches.pop(index)
+                self._save()
+                return removed
+        return None
+
+    def delete_all_matches(self) -> int:
+        count = len(self.matches)
+        if count:
+            self.matches.clear()
+            self._save()
+        return count
 
     def list_open_matches(self) -> List[Match]:
         return [m for m in self.matches if m.status == "open"]
@@ -242,6 +267,83 @@ class StatsView(discord.ui.View):
         await interaction.response.send_message(message, ephemeral=True)
 
 
+class SingleRemovalView(discord.ui.View):
+    def __init__(self, store: StatsStore, author_id: int) -> None:
+        super().__init__(timeout=300)
+        self.store = store
+        self.author_id = author_id
+
+        options: List[discord.SelectOption] = []
+        for match in self.store.matches:
+            status = match.outcome if match.outcome else match.status
+            description = f"{status.title()} at {match.display_time}" if match.status != "open" else f"Open at {match.display_time}"
+            label = f"#{match.match_id} vs {match.team}"
+            options.append(discord.SelectOption(label=label[:100], value=str(match.match_id), description=description[:100]))
+
+        if not options:
+            options.append(discord.SelectOption(label="No scrims available", value="none", default=True))
+
+        select = discord.ui.Select(placeholder="Choose a scrim to remove", options=options, min_values=1, max_values=1)
+        select.callback = self._on_select  # type: ignore[assignment]
+        self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the command user can remove scrims.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        selected = interaction.data.get("values", []) if interaction.data else []  # type: ignore[assignment]
+        if not selected:
+            await interaction.response.send_message("No scrim selected.", ephemeral=True)
+            return
+
+        value = selected[0]
+        if value == "none":
+            await interaction.response.send_message("There are no scrims to remove.", ephemeral=True)
+            return
+
+        if not str(value).isdigit():
+            await interaction.response.send_message("Invalid selection.", ephemeral=True)
+            return
+
+        removed = self.store.delete_match(int(value))
+        if removed is None:
+            await interaction.response.send_message("Scrim not found.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"Removed scrim #{removed.match_id} vs {removed.team}.", ephemeral=True
+        )
+
+
+class ScrimManagerView(discord.ui.View):
+    def __init__(self, store: StatsStore, author_id: int) -> None:
+        super().__init__(timeout=300)
+        self.store = store
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the command user can manage scrims.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Remove all", style=discord.ButtonStyle.danger)
+    async def remove_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        removed_count = self.store.delete_all_matches()
+        await interaction.response.send_message(
+            f"Removed {removed_count} scrim(s) from the database." if removed_count else "No scrims to remove.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Remove single", style=discord.ButtonStyle.secondary)
+    async def remove_single(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        view = SingleRemovalView(self.store, self.author_id)
+        await interaction.response.send_message("Select a scrim to remove.", view=view, ephemeral=True)
+
+
 def parse_day_time(day_time: str) -> Tuple[str, Optional[datetime]]:
     """Parse `DD HH:MM` into a datetime in the configured timezone."""
 
@@ -287,6 +389,24 @@ def create_timestamp(day_time: str) -> Tuple[str, str, Optional[str]]:
         return display_time, display_time, None
     formatted = discord.utils.format_dt(parsed, "F")
     return display_time, formatted, parsed.isoformat()
+
+
+def summarize_match(match: Match) -> str:
+    status_label = "Open"
+    detail = "Awaiting result"
+    if match.status == "closed":
+        if match.outcome == "win":
+            status_label = "Win"
+        elif match.outcome == "loss":
+            status_label = "Loss"
+        else:
+            status_label = "Closed"
+        detail = f"Score: {match.score}" if match.score else "Score pending"
+
+    return (
+        f"#{match.match_id} vs **{match.team}** at {match.display_time} — "
+        f"{status_label}{f' ({detail})' if detail else ''}"
+    )
 
 
 async def resolve_text_channel(bot: commands.Bot, channel_id_env: Optional[str], fallback: Optional[discord.abc.Messageable]) -> Optional[discord.TextChannel]:
@@ -395,6 +515,7 @@ async def scrim_command(
         description=f"Team: **{team_name}**\nTime: {timestamp}",
         color=discord.Color.blurple(),
     )
+    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
     scrim_message = await target_channel.send(
         content=f"{role_mention}Scrim at {display_time} against **{team_name}**",
         embed=embed,
@@ -410,7 +531,8 @@ async def scrim_command(
             pass
 
     try:
-        await scrim_message.create_thread(name=f"Scrim vs {team_name}")
+        thread = await scrim_message.create_thread(name=f"Scrim vs {team_name}")
+        store.link_thread(match.match_id, thread.id)
     except Exception:
         # Fail silently if threads are not allowed or cannot be created.
         pass
@@ -418,6 +540,15 @@ async def scrim_command(
     await interaction.response.send_message(
         f"Scrim posted in {target_channel.mention} as Match #{match.match_id}.", ephemeral=True
     )
+
+
+@bot.tree.command(name="check-scrims", description="Show all scrims and their results.")
+async def check_scrims(interaction: discord.Interaction) -> None:
+    lines = [summarize_match(match) for match in store.matches]
+    description = "\n".join(lines) if lines else "No scrims recorded yet."
+    embed = discord.Embed(title="Scrim history", description=description, color=discord.Color.blurple())
+    view = ScrimManagerView(store, interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 @bot.tree.command(name="submit-scores", description="Record a match result.")
@@ -492,6 +623,20 @@ async def cancel_match(interaction: discord.Interaction, match_id: str) -> None:
             try:
                 message = await channel.fetch_message(removed.message_id)
                 await message.reply("This scrim has been cancelled.")
+            except Exception:
+                pass
+
+    if removed.thread_id:
+        thread_channel = bot.get_channel(removed.thread_id)
+        if not isinstance(thread_channel, (discord.Thread, discord.TextChannel)):
+            try:
+                fetched = await bot.fetch_channel(removed.thread_id)
+            except Exception:
+                fetched = None
+            thread_channel = fetched if isinstance(fetched, (discord.Thread, discord.TextChannel)) else None
+        if isinstance(thread_channel, (discord.Thread, discord.TextChannel)):
+            try:
+                await thread_channel.send("This scrim has been cancelled.")
             except Exception:
                 pass
 
