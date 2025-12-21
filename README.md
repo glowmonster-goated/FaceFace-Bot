@@ -4,7 +4,7 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
 
 ## Features
 
-- `/scrim [team_name] [time] [timezone?]` – schedules a scrim, pings a configured role, creates a discussion thread, and adds ✅/❌ reactions for RSVPs.
+- `/scrim [team_name] [time] [timezone?] [meridiem?]` – schedules a scrim, pings a configured role, creates a discussion thread, and adds ✅/❌ reactions for RSVPs.
 - `/submit-scores [match] [outcome] [overall_score]` – records a win/loss for an open scrim, keeps running totals, and exposes buttons to list all wins or losses (case-insensitive team names).
 - `/cancel-match [match]` – removes an open scrim if it gets called off.
 - `/check-scrims` – shows every scrim and score, plus controls to remove one or clear them all.
@@ -47,20 +47,21 @@ A lightweight Discord bot that schedules scrims and tracks match results with sl
 - **team_name**: Opponent team name.
 - **time**: In `DD HH:MM` format. Times are parsed in the configured `TIMEZONE` (defaults to `UTC`) or the optional timezone choice and rendered as Discord timestamps; if parsing fails, the raw text is echoed.
 - **timezone (optional)**: Pick from EST/CST/PST to override the default timezone for this scrim and its reminder window.
+- **meridiem (optional)**: Choose AM or PM to clarify the hour for 12-hour style inputs.
 - Behavior: posts to `SCRIM_CHANNEL_ID` (if set, otherwise the command channel), pings the `SCRIM_ROLE_ID` (if set), adds ✅/❌ reactions for RSVPs, and opens a thread for discussion. The command author is shown on the embed, and users who tap ✅ are reminded 10 minutes before the scrim time in the selected timezone.
 
 ### `/submit-scores`
 
-- **match**: Choose from open scrims (autocomplete shows `#id vs team at time`).
+- **match**: Choose from open scrims (autocomplete shows `vs team at time`).
 - **outcome**: `win` or `loss`.
 - **overall_score**: Free-form score string (e.g., `13-11`).
 
-The response includes a results embed with the final score, schedule info, and overall record, plus buttons to show all wins or all losses. When listing opponents, repeat matches display a count (e.g., `Team ABC (2)`). Closed scrims drop out of the autocomplete list. Results are posted to `RESULTS_CHANNEL_ID` when set.
+The response includes a results embed headed "Match recorded" with the final win/loss call, score, schedule info, and overall record, plus buttons to show all wins or all losses. When listing opponents, repeat matches display a count (e.g., `Team ABC (2)`). Closed scrims drop out of the autocomplete list. Results are posted to `RESULTS_CHANNEL_ID` when set.
 
 ### `/cancel-match`
 
-- **match**: Choose from open scrims (autocomplete shows `#id vs team at time`).
-- Behavior: removes the open scrim from storage and replies to the original scrim message (when possible) that it was cancelled.
+- **match**: Choose from open scrims (autocomplete shows `vs team at time`).
+- Behavior: removes the open scrim from storage and posts "This scrim has been cancelled." inside the scrim thread.
 
 ### `/check-scrims`
 

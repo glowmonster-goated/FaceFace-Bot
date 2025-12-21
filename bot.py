@@ -286,8 +286,12 @@ class SingleRemovalView(discord.ui.View):
         options: List[discord.SelectOption] = []
         for match in self.store.matches:
             status = match.outcome if match.outcome else match.status
-            description = f"{status.title()} at {match.display_time}" if match.status != "open" else f"Open at {match.display_time}"
-            label = f"#{match.match_id} vs {match.team}"
+            description = (
+                f"{status.title()} at {match.display_time}"
+                if match.status != "open"
+                else f"Open at {match.display_time}"
+            )
+            label = f"vs {match.team}"
             options.append(discord.SelectOption(label=label[:100], value=str(match.match_id), description=description[:100]))
 
         if not options:
@@ -324,7 +328,7 @@ class SingleRemovalView(discord.ui.View):
             return
 
         await interaction.response.send_message(
-            f"Removed scrim #{removed.match_id} vs {removed.team}.", ephemeral=True
+            f"Removed scrim vs {removed.team}.", ephemeral=True
         )
 
 
@@ -360,8 +364,14 @@ def resolve_timezone_name(timezone_key: Optional[str]) -> str:
     return DEFAULT_TIMEZONE
 
 
-def parse_day_time(day_time: str, timezone_name: Optional[str]) -> Tuple[str, Optional[datetime]]:
-    """Parse `DD HH:MM` into a datetime in the supplied timezone."""
+def parse_day_time(
+    day_time: str, timezone_name: Optional[str], meridiem: Optional[str] = None
+) -> Tuple[str, Optional[datetime]]:
+    """Parse `DD HH:MM` into a datetime in the supplied timezone.
+
+    When `meridiem` is supplied ("AM" or "PM"), the hour component is interpreted
+    as 12-hour time and converted to 24-hour time for scheduling.
+    """
 
     parts = day_time.strip().split()
     if len(parts) != 2:
@@ -374,6 +384,13 @@ def parse_day_time(day_time: str, timezone_name: Optional[str]) -> Tuple[str, Op
         minute = int(hour_minute[1]) if len(hour_minute) > 1 else 0
     except (ValueError, IndexError):
         return day_time, None
+
+    if meridiem:
+        meridiem_upper = meridiem.upper()
+        if meridiem_upper == "AM" and hour == 12:
+            hour = 0
+        elif meridiem_upper == "PM" and hour != 12:
+            hour += 12
 
     try:
         tz = ZoneInfo(timezone_name or DEFAULT_TIMEZONE)
@@ -410,8 +427,12 @@ def timezone_label(timezone_name: Optional[str], parsed: Optional[datetime]) -> 
     return DEFAULT_TIMEZONE
 
 
-def create_timestamp(day_time: str, timezone_name: Optional[str]) -> Tuple[str, str, Optional[str], str]:
-    display_time, parsed = parse_day_time(day_time, timezone_name)
+def create_timestamp(
+    day_time: str, timezone_name: Optional[str], meridiem: Optional[str] = None
+) -> Tuple[str, str, Optional[str], str]:
+    display_time, parsed = parse_day_time(day_time, timezone_name, meridiem)
+    if meridiem:
+        display_time = f"{display_time} {meridiem.upper()}"
     tz_label = timezone_label(timezone_name, parsed)
     if parsed is None:
         return display_time, display_time, None, tz_label
@@ -431,10 +452,7 @@ def summarize_match(match: Match) -> str:
             status_label = "Closed"
         detail = f"Score: {match.score}" if match.score else "Score pending"
 
-    return (
-        f"#{match.match_id} vs **{match.team}** at {match.display_time} — "
-        f"{status_label}{f' ({detail})' if detail else ''}"
-    )
+    return f"vs **{match.team}** at {match.display_time} — {status_label}{f' ({detail})' if detail else ''}"
 
 
 def format_scheduled_time(match: Match) -> str:
@@ -537,19 +555,28 @@ bot = ScrimBot(store, guild_id=guild_id)
 
 
 @bot.tree.command(name="scrim", description="Schedule a scrim with a team.")
-@app_commands.describe(team_name="Opponent team name", time="Time in DD HH:MM format")
+@app_commands.describe(
+    team_name="Opponent team name",
+    time="Time in DD HH:MM format",
+    meridiem="AM or PM to clarify the time",
+)
 @app_commands.choices(
     timezone=[
         app_commands.Choice(name="Eastern (EST)", value="EST"),
         app_commands.Choice(name="Central (CST)", value="CST"),
         app_commands.Choice(name="Pacific (PST)", value="PST"),
-    ]
+    ],
+    meridiem=[
+        app_commands.Choice(name="AM", value="AM"),
+        app_commands.Choice(name="PM", value="PM"),
+    ],
 )
 async def scrim_command(
     interaction: discord.Interaction,
     team_name: str,
     time: str,
     timezone: Optional[app_commands.Choice[str]] = None,
+    meridiem: Optional[app_commands.Choice[str]] = None,
 ) -> None:
     target_channel = await resolve_text_channel(bot, SCRIM_CHANNEL_ID_ENV, interaction.channel)
     if target_channel is None:
@@ -559,7 +586,9 @@ async def scrim_command(
         return
 
     timezone_name = resolve_timezone_name(timezone.value if timezone else None)
-    display_time, timestamp, iso_time, tz_label = create_timestamp(time, timezone_name)
+    display_time, timestamp, iso_time, tz_label = create_timestamp(
+        time, timezone_name, meridiem.value if meridiem else None
+    )
     annotated_time = f"{display_time} {tz_label}".strip()
     match = store.add_match(team_name, annotated_time, iso_time, timezone_name)
     role_mention = f"<@&{scrim_role_id_env}> " if scrim_role_id_env else ""
@@ -591,7 +620,7 @@ async def scrim_command(
         pass
 
     await interaction.response.send_message(
-        f"Scrim posted in {target_channel.mention} as Match #{match.match_id}.", ephemeral=True
+        f"Scrim posted in {target_channel.mention}.", ephemeral=True
     )
 
 
@@ -633,17 +662,19 @@ async def submit_scores(
 
     won = outcome.value == "win"
     result_label = "Win" if won else "Loss"
-    result_emoji = "✅" if won else "❌"
     embed_color = discord.Color.brand_green() if won else discord.Color.red()
     scheduled_value = format_scheduled_time(match)
 
     embed = discord.Embed(
-        title=f"{result_emoji} {result_label} vs {match.team}",
-        description=f"Score: **{overall_score}**\nScheduled: {scheduled_value}",
+        title="Match recorded",
+        description=(
+            f"{result_label} vs **{match.team}**\n"
+            f"Score: **{overall_score}**\n"
+            f"Scheduled: {scheduled_value}"
+        ),
         color=embed_color,
     )
-    embed.add_field(name="Record", value=f"Wins: {wins}\nLosses: {losses}", inline=True)
-    embed.add_field(name="Match ID", value=f"#{match.match_id}", inline=True)
+    embed.add_field(name="Record", value=f"Wins: {wins}\nLosses: {losses}", inline=False)
     embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
 
     view = bot.get_stats_view()
@@ -661,8 +692,8 @@ async def submit_scores(
 async def match_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     choices: List[app_commands.Choice[str]] = []
     for match in store.list_open_matches():
-        label = f"#{match.match_id} vs {match.team} at {match.display_time}"
-        choices.append(app_commands.Choice(name=label, value=str(match.match_id)))
+        label = f"vs {match.team} at {match.display_time}"
+        choices.append(app_commands.Choice(name=label[:100], value=str(match.match_id)))
     return choices[:25]
 
 
@@ -677,15 +708,6 @@ async def cancel_match(interaction: discord.Interaction, match_id: str) -> None:
     if removed is None:
         await interaction.response.send_message("Match not found or already closed.", ephemeral=True)
         return
-
-    if removed.channel_id and removed.message_id:
-        channel = bot.get_channel(removed.channel_id)
-        if isinstance(channel, discord.TextChannel):
-            try:
-                message = await channel.fetch_message(removed.message_id)
-                await message.reply("This scrim has been cancelled.")
-            except Exception:
-                pass
 
     if removed.thread_id:
         thread_channel = bot.get_channel(removed.thread_id)
