@@ -1,13 +1,27 @@
-# bot.py — Scrim scheduler + 10-min reminder + results tracking
+# bot.py — FaceFace Scrim Manager
 #
-# What THIS version does (matching what you just said):
-# ✅ Main scrim message pings the TEAM ROLE (SCRIM_ROLE_ID) ONLY there
-# ✅ Reminder message does NOT ping the role (only ✅ users)
-# ✅ Reminder posts in the THREAD (falls back to scrim channel if no thread)
-# ✅ No "(EST)" anywhere (Discord timestamps already localize)
+# ✅ Main scrim message pings TEAM ROLE (SCRIM_ROLE_ID) ONLY in the main scrim post
+# ✅ Reminder posts in the THREAD and pings ONLY ✅ users (no role ping)
 # ✅ Reminder format:
 #    ⏰ - 10 minute reminder
 #    scrim vs (team) starts at (time-only timestamp)
+# ✅ Time input supports:
+#    - "3:50" (defaults PM)
+#    - "15:50" (24h)
+#    - "25 2:35" (day + time)
+# ✅ Default timezone = EST if not chosen
+# ✅ No "(EST)" appended anywhere (Discord timestamps localize)
+# ✅ /check-scrims -> Remove all now resets scrims AND win/loss records (no ghost stats)
+#
+# .env expected:
+# DISCORD_TOKEN=...
+# GUILD_ID=123...                  (optional but recommended for fast slash sync)
+# SCRIM_CHANNEL_ID=123...
+# RESULTS_CHANNEL_ID=123...         (optional)
+# SCRIM_ROLE_ID=123...              (optional but you want this)
+# TIMEZONE=UTC                      (optional)
+# COMMAND_ROLE_ID_1=123...          (optional; who can run commands)
+# COMMAND_ROLE_ID_2=123...          (optional; second role)
 
 import json
 import os
@@ -26,10 +40,10 @@ load_dotenv()
 
 DATA_PATH = Path("stats.json")
 
-DEFAULT_TIMEZONE = os.environ.get("TIMEZONE", "UTC")  # fallback only
+DEFAULT_TIMEZONE = os.environ.get("TIMEZONE", "UTC")
 SCRIM_CHANNEL_ID_ENV = os.environ.get("SCRIM_CHANNEL_ID")
 RESULTS_CHANNEL_ID_ENV = os.environ.get("RESULTS_CHANNEL_ID")
-SCRIM_ROLE_ID_ENV = os.environ.get("SCRIM_ROLE_ID")  # <-- role ping ONLY in main scrim message
+SCRIM_ROLE_ID_ENV = os.environ.get("SCRIM_ROLE_ID")
 
 COMMAND_ROLE_IDS = {
     int(role_id)
@@ -47,7 +61,7 @@ NA_TIMEZONES: Dict[str, str] = {
 }
 
 
-# -------------------- data models --------------------
+# -------------------- models --------------------
 
 @dataclass
 class TeamRecord:
@@ -74,11 +88,14 @@ class Match:
     display_time: str
     time_iso: Optional[str]
     timezone: Optional[str] = None
+
     channel_id: Optional[int] = None
     message_id: Optional[int] = None
     thread_id: Optional[int] = None
+
     interested_user_ids: List[int] = field(default_factory=list)  # ✅ reactors
     reminder_sent: bool = False
+
     status: Literal["open", "closed"] = "open"
     outcome: Optional[Literal["win", "loss"]] = None
     score: Optional[str] = None
@@ -119,7 +136,7 @@ class Match:
         )
 
 
-# -------------------- storage --------------------
+# -------------------- persistence --------------------
 
 class StatsStore:
     def __init__(self, path: Path) -> None:
@@ -255,6 +272,13 @@ class StatsStore:
             self._save()
         return count
 
+    # ✅ THIS is the fix for ghost wins/losses
+    def reset_all_stats(self) -> None:
+        self.matches.clear()
+        self.teams.clear()
+        self.next_match_id = 1
+        self._save()
+
     def list_open_matches(self) -> List[Match]:
         return [m for m in self.matches if m.status == "open"]
 
@@ -274,13 +298,6 @@ class StatsStore:
         self.record_result(match.team, outcome)
         self._save()
         return match
-
-    def reset_all_stats(self) -> None:
-        # clears BOTH scrims list AND win/loss totals
-        self.matches.clear()
-        self.teams.clear(). 
-        self.next_match_id = 1
-        self._save()
 
 
 # -------------------- views --------------------
@@ -304,7 +321,10 @@ class StatsView(discord.ui.View):
         if not pairs:
             message = f"No {title.lower()} recorded yet."
         else:
-            message = "\n".join(f"{name} ({count})" if count > 1 else name for name, count in pairs)
+            message = "\n".join(
+                f"{name} ({count})" if count > 1 else name
+                for name, count in pairs
+            )
         await interaction.response.send_message(message, ephemeral=True)
 
 
@@ -379,12 +399,13 @@ class ScrimManagerView(discord.ui.View):
         return True
 
     @discord.ui.button(label="Remove all", style=discord.ButtonStyle.danger)
-async def remove_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-    self.store.reset_all_stats()
-    await interaction.response.send_message(
-        "All scrims AND win/loss records were reset.",
-        ephemeral=True,
-    )
+    async def remove_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        # ✅ Clears matches AND team win/loss totals
+        self.store.reset_all_stats()
+        await interaction.response.send_message(
+            "Removed all scrims and reset win/loss record.",
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Remove single", style=discord.ButtonStyle.secondary)
     async def remove_single(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
@@ -394,14 +415,12 @@ async def remove_all(self, interaction: discord.Interaction, button: discord.ui.
 # -------------------- time helpers --------------------
 
 def resolve_timezone_name(timezone_key: Optional[str]) -> str:
-    # Default to EST if user doesn't choose one
+    # Default EST if not provided
     if not timezone_key:
         timezone_key = "EST"
-
     if timezone_key in NA_TIMEZONES:
         return NA_TIMEZONES[timezone_key]
-
-    # Allow IANA zones if provided
+    # allow IANA if user ever passes it
     try:
         ZoneInfo(timezone_key)
         return timezone_key
@@ -409,19 +428,21 @@ def resolve_timezone_name(timezone_key: Optional[str]) -> str:
         return NA_TIMEZONES["EST"]
 
 
-def parse_day_time(text: str, timezone_name: Optional[str], meridiem: Optional[str] = None) -> Tuple[str, Optional[datetime]]:
+def parse_day_time(
+    text: str,
+    timezone_name: Optional[str],
+    meridiem: Optional[str] = None
+) -> Tuple[str, Optional[datetime]]:
     """
     Accepts:
       - "3:50" or "3"
-      - "25 2:35"
+      - "25 2:35"  (day + time)
 
     Defaults:
       - timezone defaults to EST
-      - if meridiem missing and hour 1..11 => PM
-
-    Scheduling:
-      - no day => today, else tomorrow if passed
-      - with day => this month, else next month if passed
+      - meridiem default: if missing and hour 1..11 => PM
+      - date default: if day not given => today, else tomorrow if time already passed
+      - if day given and already passed this month => next month
     """
     tz_name = timezone_name or NA_TIMEZONES["EST"]
     try:
@@ -444,13 +465,13 @@ def parse_day_time(text: str, timezone_name: Optional[str], meridiem: Optional[s
         return text, None
 
     try:
-        hm = time_part.split(":") if time_part else []
+        hm = (time_part or "").split(":")
         hour = int(hm[0])
         minute = int(hm[1]) if len(hm) > 1 else 0
-    except (ValueError, IndexError, AttributeError):
+    except Exception:
         return text, None
 
-    # Default PM if missing for 1..11
+    # default PM if missing and hour looks like 12-hour
     if meridiem is None and 1 <= hour <= 11:
         meridiem = "PM"
 
@@ -479,29 +500,36 @@ def parse_day_time(text: str, timezone_name: Optional[str], meridiem: Optional[s
     return text, candidate
 
 
-def create_timestamp(time_text: str, timezone_name: Optional[str], meridiem: Optional[str] = None) -> Tuple[str, str, Optional[str]]:
-    """
-    Returns:
-      display_time (what user typed),
-      timestamp_str (Discord formatted),
-      iso_time (for reminders)
-    """
+def create_timestamp(
+    time_text: str,
+    timezone_name: Optional[str],
+    meridiem: Optional[str] = None
+) -> Tuple[str, str, Optional[str]]:
     display_time, parsed = parse_day_time(time_text, timezone_name, meridiem)
     if parsed is None:
         return display_time, display_time, None
-
-    formatted = discord.utils.format_dt(parsed, "F")
+    formatted = discord.utils.format_dt(parsed, "F")  # full timestamp (localized for viewers)
     return display_time, formatted, parsed.isoformat()
 
 
-# -------------------- misc helpers --------------------
+def format_time_only_from_iso(time_iso: str) -> str:
+    # event time as a time-only discord timestamp
+    dt = datetime.fromisoformat(time_iso)
+    return discord.utils.format_dt(dt, "t")
+
 
 def summarize_match(match: Match) -> str:
     status_label = "Open"
     detail = "Awaiting result"
     if match.status == "closed":
-        status_label = "Win" if match.outcome == "win" else "Loss" if match.outcome == "loss" else "Closed"
+        if match.outcome == "win":
+            status_label = "Win"
+        elif match.outcome == "loss":
+            status_label = "Loss"
+        else:
+            status_label = "Closed"
         detail = f"Score: {match.score}" if match.score else "Score pending"
+
     return f"vs **{match.team}** at {match.display_time} — {status_label}{f' ({detail})' if detail else ''}"
 
 
@@ -571,6 +599,7 @@ class ScrimBot(commands.Bot):
         if not self.reminder_loop.is_running():
             self.reminder_loop.start()
 
+        # slash sync
         if self.guild_id:
             guild = discord.Object(id=self.guild_id)
             self.tree.copy_global_to(guild=guild)
@@ -589,34 +618,35 @@ class ScrimBot(commands.Bot):
             except ValueError:
                 continue
 
-            tz_name = match.timezone or resolve_timezone_name(None)
-            try:
-                tz_info = ZoneInfo(tz_name)
-            except Exception:
-                tz_info = event_time.tzinfo
-
-            if event_time.tzinfo is None and tz_info is not None:
-                event_time = event_time.replace(tzinfo=tz_info)
-
             now = datetime.now(tz=event_time.tzinfo) if event_time.tzinfo else datetime.utcnow()
 
             if event_time - timedelta(minutes=10) <= now < event_time:
-                # Reminder target: thread first, else main channel
+                # post reminder in thread (fallback: channel)
                 target: Optional[discord.abc.Messageable] = None
+
                 if match.thread_id:
                     target = await fetch_text_or_thread(self, match.thread_id)
+
                 if target is None and match.channel_id:
                     target = await fetch_text_or_thread(self, match.channel_id)
+
                 if target is None:
                     continue
 
-                # Ping ONLY ✅ users (NO role ping here)
-                user_mentions = " ".join(f"<@{uid}>" for uid in match.interested_user_ids)
+                # ping ONLY ✅ users
+                mentions = " ".join(f"<@{uid}>" for uid in match.interested_user_ids)
                 time_only = discord.utils.format_dt(event_time, "t")
+
+                message = (
+                    f"⏰ - 10 minute reminder\n"
+                    f"scrim vs **{match.team}** starts at {time_only}"
+                )
+                if mentions:
+                    message += f"\n{mentions}"
 
                 try:
                     await target.send(
-                        f"⏰ - 10 minute reminder\nscrim vs **{match.team}** starts at {time_only}\n{user_mentions}".strip(),
+                        message,
                         allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                     )
                     self.store.mark_reminder_sent(match.match_id)
@@ -624,13 +654,13 @@ class ScrimBot(commands.Bot):
                     continue
 
 
-# -------------------- init --------------------
-
 store = StatsStore(DATA_PATH)
 guild_id_env = os.environ.get("GUILD_ID")
 guild_id = int(guild_id_env) if guild_id_env and guild_id_env.isdigit() else None
 bot = ScrimBot(store, guild_id=guild_id)
 
+
+# -------------------- permissions --------------------
 
 def member_has_command_role(member: Optional[discord.Member]) -> bool:
     if not COMMAND_ROLE_IDS:
@@ -697,6 +727,7 @@ async def scrim_command(
         return
 
     timezone_name = resolve_timezone_name(timezone.value if timezone else None)
+
     display_time, timestamp_full, iso_time = create_timestamp(
         time,
         timezone_name,
@@ -705,19 +736,19 @@ async def scrim_command(
 
     if iso_time is None:
         await interaction.response.send_message(
-            "Could not parse that time. Examples: `3:50`, `3 PM`, `15:50`, or `25 2:35`.",
+            "Could not parse that time. Examples: `3:50`, `15:50`, or `25 2:35`.",
             ephemeral=True,
         )
         return
 
     match = store.add_match(team_name, display_time, iso_time, timezone_name)
 
-    # MAIN MESSAGE ROLE PING (ONLY HERE)
+    # ✅ Team role ping ONLY in main scrim message
     role_mention = ""
     if SCRIM_ROLE_ID_ENV and SCRIM_ROLE_ID_ENV.isdigit():
         role_mention = f"<@&{int(SCRIM_ROLE_ID_ENV)}> "
 
-    # Simple main message text + timestamp
+    # simpler main message content
     content_line = f"{role_mention}Scrim vs **{team_name}** — {timestamp_full}"
 
     embed = discord.Embed(
@@ -735,6 +766,7 @@ async def scrim_command(
 
     store.link_message(match.match_id, scrim_message.channel.id, scrim_message.id)
 
+    # ✅ use real unicode emojis (no weird âœ…)
     for emoji in ("✅", "❌"):
         try:
             await scrim_message.add_reaction(emoji)
@@ -764,7 +796,7 @@ async def check_scrims(interaction: discord.Interaction) -> None:
 @app_commands.describe(
     match_id="Choose an open match to record",
     outcome="Did we win or lose?",
-    overall_score="Score summary, e.g. 13-11",
+    overall_score="Score summary, e.g. 9-3",
 )
 @app_commands.choices(
     outcome=[
@@ -788,6 +820,7 @@ async def submit_scores(
         return
 
     wins, losses = store.totals()
+
     won = outcome.value == "win"
     result_label = "Win" if won else "Loss"
     embed_color = discord.Color.brand_green() if won else discord.Color.red()
@@ -817,14 +850,14 @@ async def submit_scores(
             ephemeral=True,
         )
     else:
-        await interaction.response.send_message(embed=embed, view=view)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 @submit_scores.autocomplete("match_id")
 async def match_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     choices: List[app_commands.Choice[str]] = []
     for match in store.list_open_matches():
-        label = f"vs {match.team} at {match.display_time}"
+        label = f"#{match.match_id} vs {match.team} @ {match.display_time}"
         choices.append(app_commands.Choice(name=label[:100], value=str(match.match_id)))
     return choices[:25]
 
@@ -842,6 +875,7 @@ async def cancel_match(interaction: discord.Interaction, match_id: str) -> None:
         await interaction.response.send_message("Match not found or already closed.", ephemeral=True)
         return
 
+    # notify in thread if exists
     if removed.thread_id:
         target = await fetch_text_or_thread(bot, removed.thread_id)
         if target:
@@ -860,6 +894,8 @@ async def cancel_match(interaction: discord.Interaction, match_id: str) -> None:
 async def cancel_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     return await match_autocomplete(interaction, current)
 
+
+# -------------------- reactions --------------------
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
