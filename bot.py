@@ -1,19 +1,13 @@
 # bot.py — Scrim scheduler + 10-min reminder + results tracking
 #
-# What this version does (matches your requests):
-# ✅ /scrim accepts time as "3:50" OR "25 2:35" (date optional)
-# ✅ Default timezone = EST if user doesn't choose one
-# ✅ Default meridiem = PM if user doesn't choose AM/PM (for 1..11)
-# ✅ Main scrim message is simple (no "(EST)" anywhere)
-# ✅ Thread is created per scrim; reminder posts INSIDE the thread
-# ✅ Reminder pings ONLY ✅ reactors (no team role ping)
+# What THIS version does (matching what you just said):
+# ✅ Main scrim message pings the TEAM ROLE (SCRIM_ROLE_ID) ONLY there
+# ✅ Reminder message does NOT ping the role (only ✅ users)
+# ✅ Reminder posts in the THREAD (falls back to scrim channel if no thread)
+# ✅ No "(EST)" anywhere (Discord timestamps already localize)
 # ✅ Reminder format:
 #    ⏰ - 10 minute reminder
 #    scrim vs (team) starts at (time-only timestamp)
-#
-# Notes:
-# - Discord timestamps auto-localize for each viewer.
-# - Save this file as UTF-8 (to keep ✅/❌ correct).
 
 import json
 import os
@@ -35,6 +29,7 @@ DATA_PATH = Path("stats.json")
 DEFAULT_TIMEZONE = os.environ.get("TIMEZONE", "UTC")  # fallback only
 SCRIM_CHANNEL_ID_ENV = os.environ.get("SCRIM_CHANNEL_ID")
 RESULTS_CHANNEL_ID_ENV = os.environ.get("RESULTS_CHANNEL_ID")
+SCRIM_ROLE_ID_ENV = os.environ.get("SCRIM_ROLE_ID")  # <-- role ping ONLY in main scrim message
 
 COMMAND_ROLE_IDS = {
     int(role_id)
@@ -302,11 +297,7 @@ class StatsView(discord.ui.View):
         if not pairs:
             message = f"No {title.lower()} recorded yet."
         else:
-            lines = []
-            for name, count in pairs:
-                label = f"{name} ({count})" if count > 1 else name
-                lines.append(label)
-            message = "\n".join(lines)
+            message = "\n".join(f"{name} ({count})" if count > 1 else name for name, count in pairs)
         await interaction.response.send_message(message, ephemeral=True)
 
 
@@ -324,10 +315,9 @@ class SingleRemovalView(discord.ui.View):
                 if match.status != "open"
                 else f"Open at {match.display_time}"
             )
-            label = f"vs {match.team}"
             options.append(
                 discord.SelectOption(
-                    label=label[:100],
+                    label=f"vs {match.team}"[:100],
                     value=str(match.match_id),
                     description=description[:100],
                 )
@@ -391,21 +381,20 @@ class ScrimManagerView(discord.ui.View):
 
     @discord.ui.button(label="Remove single", style=discord.ButtonStyle.secondary)
     async def remove_single(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
-        view = SingleRemovalView(self.store, self.author_id)
-        await interaction.response.send_message("Select a scrim to remove.", view=view, ephemeral=True)
+        await interaction.response.send_message("Select a scrim to remove.", view=SingleRemovalView(self.store, self.author_id), ephemeral=True)
 
 
 # -------------------- time helpers --------------------
 
 def resolve_timezone_name(timezone_key: Optional[str]) -> str:
-    # Default to EST if user doesn't choose a timezone
+    # Default to EST if user doesn't choose one
     if not timezone_key:
         timezone_key = "EST"
 
     if timezone_key in NA_TIMEZONES:
         return NA_TIMEZONES[timezone_key]
 
-    # If they somehow pass a real IANA zone, allow it
+    # Allow IANA zones if provided
     try:
         ZoneInfo(timezone_key)
         return timezone_key
@@ -494,7 +483,6 @@ def create_timestamp(time_text: str, timezone_name: Optional[str], meridiem: Opt
     if parsed is None:
         return display_time, display_time, None
 
-    # Full date/time for the embed (Discord shows localized)
     formatted = discord.utils.format_dt(parsed, "F")
     return display_time, formatted, parsed.isoformat()
 
@@ -505,14 +493,8 @@ def summarize_match(match: Match) -> str:
     status_label = "Open"
     detail = "Awaiting result"
     if match.status == "closed":
-        if match.outcome == "win":
-            status_label = "Win"
-        elif match.outcome == "loss":
-            status_label = "Loss"
-        else:
-            status_label = "Closed"
+        status_label = "Win" if match.outcome == "win" else "Loss" if match.outcome == "loss" else "Closed"
         detail = f"Score: {match.score}" if match.score else "Score pending"
-
     return f"vs **{match.team}** at {match.display_time} — {status_label}{f' ({detail})' if detail else ''}"
 
 
@@ -542,15 +524,10 @@ async def resolve_text_channel(
             fetched = None
         if isinstance(fetched, discord.TextChannel):
             return fetched
-
     return fallback if isinstance(fallback, discord.TextChannel) else None
 
 
 async def fetch_text_or_thread(bot: commands.Bot, channel_id: int) -> Optional[discord.abc.Messageable]:
-    """
-    Fetch a TextChannel or Thread by id (cache -> fetch).
-    Returns something you can .send() to, or None.
-    """
     ch = bot.get_channel(channel_id)
     if isinstance(ch, (discord.TextChannel, discord.Thread)):
         return ch
@@ -605,7 +582,6 @@ class ScrimBot(commands.Bot):
             except ValueError:
                 continue
 
-            # ensure tzinfo (should already have it, but safe)
             tz_name = match.timezone or resolve_timezone_name(None)
             try:
                 tz_info = ZoneInfo(tz_name)
@@ -618,21 +594,17 @@ class ScrimBot(commands.Bot):
             now = datetime.now(tz=event_time.tzinfo) if event_time.tzinfo else datetime.utcnow()
 
             if event_time - timedelta(minutes=10) <= now < event_time:
-                # choose thread if available, else main channel
+                # Reminder target: thread first, else main channel
                 target: Optional[discord.abc.Messageable] = None
                 if match.thread_id:
                     target = await fetch_text_or_thread(self, match.thread_id)
-
                 if target is None and match.channel_id:
                     target = await fetch_text_or_thread(self, match.channel_id)
-
                 if target is None:
                     continue
 
-                # ping ONLY ✅ users
+                # Ping ONLY ✅ users (NO role ping here)
                 user_mentions = " ".join(f"<@{uid}>" for uid in match.interested_user_ids)
-
-                # time-only timestamp (no date/month)
                 time_only = discord.utils.format_dt(event_time, "t")
 
                 try:
@@ -718,7 +690,6 @@ async def scrim_command(
         return
 
     timezone_name = resolve_timezone_name(timezone.value if timezone else None)
-
     display_time, timestamp_full, iso_time = create_timestamp(
         time,
         timezone_name,
@@ -732,12 +703,15 @@ async def scrim_command(
         )
         return
 
-    # Store a simpler display_time (time-only) for lists (no timezone label)
-    # Keep it as what they typed, since you wanted it simple
     match = store.add_match(team_name, display_time, iso_time, timezone_name)
 
-    # Main scrim message: simple and clean
-    content_line = f"Scrim vs **{team_name}** — {timestamp_full}"
+    # MAIN MESSAGE ROLE PING (ONLY HERE)
+    role_mention = ""
+    if SCRIM_ROLE_ID_ENV and SCRIM_ROLE_ID_ENV.isdigit():
+        role_mention = f"<@&{int(SCRIM_ROLE_ID_ENV)}> "
+
+    # Simple main message text + timestamp
+    content_line = f"{role_mention}Scrim vs **{team_name}** — {timestamp_full}"
 
     embed = discord.Embed(
         title="Scrim scheduled",
@@ -749,7 +723,7 @@ async def scrim_command(
     scrim_message = await target_channel.send(
         content=content_line,
         embed=embed,
-        allowed_mentions=discord.AllowedMentions(roles=False, users=False, everyone=False),
+        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
     )
 
     store.link_message(match.match_id, scrim_message.channel.id, scrim_message.id)
@@ -760,7 +734,6 @@ async def scrim_command(
         except Exception:
             pass
 
-    # Create thread and store it (reminders post there)
     try:
         thread = await scrim_message.create_thread(name=f"Scrim vs {team_name}")
         store.link_thread(match.match_id, thread.id)
@@ -776,8 +749,7 @@ async def check_scrims(interaction: discord.Interaction) -> None:
     lines = [summarize_match(match) for match in store.matches]
     description = "\n".join(lines) if lines else "No scrims recorded yet."
     embed = discord.Embed(title="Scrim history", description=description, color=discord.Color.blurple())
-    view = ScrimManagerView(store, interaction.user.id)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=ScrimManagerView(store, interaction.user.id), ephemeral=True)
 
 
 @bot.tree.command(name="submit-scores", description="Record a match result.")
@@ -863,7 +835,6 @@ async def cancel_match(interaction: discord.Interaction, match_id: str) -> None:
         await interaction.response.send_message("Match not found or already closed.", ephemeral=True)
         return
 
-    # Notify thread if exists
     if removed.thread_id:
         target = await fetch_text_or_thread(bot, removed.thread_id)
         if target:
@@ -887,9 +858,7 @@ async def cancel_autocomplete(interaction: discord.Interaction, current: str) ->
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if bot.user and payload.user_id == bot.user.id:
         return
-
-    emoji = str(payload.emoji)
-    if emoji != "✅":
+    if str(payload.emoji) != "✅":
         return
 
     for match in store.list_open_matches():
@@ -903,9 +872,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 def main() -> None:
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
-        raise SystemExit(
-            "DISCORD_TOKEN environment variable is required. Set it in a .env file or export it before running the bot."
-        )
+        raise SystemExit("DISCORD_TOKEN is required (put it in .env).")
     bot.run(token)
 
 
