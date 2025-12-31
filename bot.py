@@ -275,6 +275,13 @@ class StatsStore:
         self._save()
         return match
 
+    def reset_all_stats(self) -> None:
+        # clears BOTH scrims list AND win/loss totals
+        self.matches.clear()
+        self.teams.clear(). 
+        self.next_match_id = 1
+        self._save()
+
 
 # -------------------- views --------------------
 
@@ -372,12 +379,12 @@ class ScrimManagerView(discord.ui.View):
         return True
 
     @discord.ui.button(label="Remove all", style=discord.ButtonStyle.danger)
-    async def remove_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
-        removed_count = self.store.delete_all_matches()
-        await interaction.response.send_message(
-            f"Removed {removed_count} scrim(s) from the database." if removed_count else "No scrims to remove.",
-            ephemeral=True,
-        )
+async def remove_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    self.store.reset_all_stats()
+    await interaction.response.send_message(
+        "All scrims AND win/loss records were reset.",
+        ephemeral=True,
+    )
 
     @discord.ui.button(label="Remove single", style=discord.ButtonStyle.secondary)
     async def remove_single(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
